@@ -1,4 +1,6 @@
 #include "SwdDevice_SPI.hpp"
+#include <coco/bits.hpp>
+#include <coco/convert.hpp>
 #include <coco/debug.hpp>
 
 
@@ -24,7 +26,7 @@ SwdDevice_SPI::SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config
 
     spi_ = spiInfo.enableClock()
         .configureMaster(clockConfig,
-            spi::Config::PHA0_POL0 | spi::Config::LSB_FIRST,
+            spi::Config::PHA1_POL1 | spi::Config::LSB_FIRST,
             spi::Format::DATA_8,
             spi::Interrupt::RX)
         .start();
@@ -73,16 +75,17 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             spi_.setFormat(spi::Format::DATA_5);
 
             // dummy write to start read transfer
-            TXDR8 = 0x0e;
+            TXDR8 = 0;
         }
         break;
     case Phase::ACK:
         {
-            // read data register (clears RXNE flag)
-            uint32_t data = RXDR8;
+            // read reply (turn, ack, read: 1st data bit, write: turn, clears RXNE flag)
+            int reply = RXDR8;
 
-            // extract ack field
-            int ack = (data >> 1) & 7;
+            // extract ack field (3 bits)
+            uint8_t ack = (reply >> 1) & 7;
+            //debug::out << "ack " << hex(ack) << '\n';
 
             if (!write_) {
                 // read 33 bytes (31 data, 1 parity, 1 turnaround)
@@ -91,7 +94,7 @@ void SwdDevice_SPI::SPI_IRQHandler() {
                 phase_ = Phase::READ_DATA1;
 
                 // store first bit that was already read
-                data_ = (data >> 4) & 1;
+                data_ = (reply >> 4) & 1;
 
                 // read first 12 bit
                 spi_.setFormat(spi::Format::DATA_12);
@@ -111,7 +114,7 @@ void SwdDevice_SPI::SPI_IRQHandler() {
                 spi_.setFormat(spi::Format::DATA_13);
 
                 // start transfer
-                data = data_;
+                uint32_t data = data_;
                 TXDR16 = data;
                 data_ = (data >> 13) | (parity(data) << 19);
             }
@@ -119,11 +122,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
         break;
     case Phase::READ_DATA1:
         {
+            //debug::out << "read1\n";
+
             // get 12 bit
             data_ |= (RXDR16 & 0xfff) << 1;
 
             // next data phase
-            phase_ = Phase::WRITE_DATA2;
+            phase_ = Phase::READ_DATA2;
 
             // read next 13 bit
             spi_.setFormat(spi::Format::DATA_13);
@@ -134,11 +139,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
         break;
     case Phase::READ_DATA2:
         {
+            //debug::out << "read2\n";
+
             // get 13 bit
             data_ |= (RXDR16 & 0x1fff) << 13;
 
             // next data phase
-            phase_ = Phase::WRITE_DATA3;
+            phase_ = Phase::READ_DATA3;
 
             // read remaining 8 bit
             spi_.setFormat(spi::Format::DATA_8);
@@ -150,14 +157,23 @@ void SwdDevice_SPI::SPI_IRQHandler() {
     case Phase::READ_DATA3:
         {
             // get remaining 8 bit
-            data_ |= RXDR8 << 24;
+            int tail = RXDR8;
+
+            uint32_t data = data_ | (tail << 26);
+            //debug::out << "data " << hex(data) << '\n';
+
+            int parityError = parity(data) ^ ((tail >> 6) & 1);
 
             // return to request phase
             phase_ = Phase::REQUEST;
 
             // end of transfer
             int r = transfers_.pop(
-                [this](BufferBase &buffer) {
+                [this, data, parityError](BufferBase &buffer) {
+                    *(uint32_t *)buffer.data_ = data;
+                    buffer.size_ = 4;
+                    buffer.result_ = parityError ? BufferBase::Result::FAIL : BufferBase::Result::SUCCESS;
+
                     // notify app that buffer has finished
                     loop_.push(buffer);
                     return true;
@@ -185,7 +201,7 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             // start transfer
             uint32_t data = data_;
             TXDR16 = data;
-            data_ = (data >> 15);
+            data_ = (data >> 13);
         }
         break;
     case Phase::WRITE_DATA2:
@@ -207,6 +223,8 @@ void SwdDevice_SPI::SPI_IRQHandler() {
         break;
     case Phase::WRITE_DATA3:
         {
+            //debug::out << "write3\n";
+
             // read data register to clear RXNE flag
             int dummy = RXDR8;
             (void)dummy;
@@ -241,10 +259,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             if (data > 0) {
                 // send more clock cycles
                 data_ = data - 1;
-                TXDR16 = 0;
+                TXDR16 = data == 5 ? 0b1110011110011110 : (data == 1 ? 0b0011111111111111 : 0xffff);
             } else {
                 // reset finished
                 resetPending_ = false;
+
+                // disable output
+                gpio::enableInput(mosiPin_);
 
                 // reset format and phase
                 phase_ = Phase::REQUEST;
@@ -263,13 +284,16 @@ void SwdDevice_SPI::SPI_IRQHandler() {
 void SwdDevice_SPI::startReset() {
     auto &TXDR16 = spi_.TXDR16();
 
+    // enable output
+    gpio::enableAlternate(mosiPin_);
+
     phase_ = Phase::RESET;
 
     // start 50 clock cycles
     spi_.setFormat(spi::Format::DATA_16);
 
     // use as counter
-    data_ = 3;
+    data_ = 8;
 
     TXDR16 = 0xffff;
 }
@@ -352,7 +376,7 @@ void SwdDevice_SPI::BufferBase::start() {
     TXDR8 = request;
 
     // -> wait for SPI interrupt
-    debug::out << "start\n";
+    //debug::out << "start " << hex(request) << "\n";
 }
 
 void SwdDevice_SPI::BufferBase::handle() {

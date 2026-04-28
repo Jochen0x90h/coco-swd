@@ -13,7 +13,7 @@ namespace coco {
 
 
 /// @brief Implementation of SWD for STM32
-///
+/// https://qcentlabs.com/posts/swd_banger/
 class SwdDevice_SPI : public SwdDevice {
 public:
     /// @brief Constructor for the SWD device.
@@ -22,9 +22,9 @@ public:
     /// @param misoPin Data input pin, port and alternate function (see data sheet), connect to SWDIO
     /// @param mosiPin Data output pin, port and alternate function (see data sheet), connect to SWDIO
     /// @param spiInfo Info of SPI instance to use
-    /// @param clockConfig SPI Clock configuration
+    /// @param prescaler SPI prescaler
     SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config misoPin, gpio::Config mosiPin,
-        const spi::Info &spiInfo, spi::ClockConfig clockConfig);
+        const spi::Info &spiInfo, spi::Format prescaler);
 
 
     // internal buffer base class, derives from IntrusiveListNode for the list of buffers and Loop_Queue::Handler to be notified from the event loop
@@ -39,15 +39,14 @@ public:
         ~BufferBase() override;
 
         // Buffer methods
-        bool start(Op op) override;
+        bool start() override;
         bool cancel() override;
 
     protected:
-        void start();
+        void transfer();
         void handle() override;
 
         SwdDevice_SPI &device_;
-        Op op_;
     };
 
     /// @brief Buffer for transferring data to/from a SWD device.

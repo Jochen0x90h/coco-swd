@@ -10,27 +10,23 @@ namespace coco {
 /// https://developer.arm.com/documentation/ddi0413/c/debug-access-port/sw-dp/protocol-description
 class SwdDevice : public BufferDevice {
 public:
+    /// @brief Buffer header type
+    ///
+    enum class HeaderType {
+        // header contains a register designated by swd::Register
+        REGISTER = 0,
 
-    enum class Request : uint32_t {
-        DEBUG_PORT = 0,
-        ACCESS_PORT = 1 << 1,
-        PORT_MASK = 1 << 1,
-
-        ADDRESS_0 = 0,
-        ADDRESS_4 = 1 << 3,
-        ADDRESS_8 = 2 << 3,
-        ADDRESS_12 = 3 << 3,
-        ADDRESS_MASK = 3 << 3,
+        // header contains an address for Register::TAR, data gets read/writte to Register::DRW assuming bank 0
+        ADDRESS = 1,
     };
 
     SwdDevice(State state) : BufferDevice(state) {}
 
     virtual ~SwdDevice() {}
 
-    /// @brief Emit reset sequence
-    /// Emits 50 cycles of SWCLK with SWDIO high after all pending transfers
+    /// @brief Emit reset sequence after all pending transfers.
+    /// Reset sequence is 50+ cycles of SWCLK with SWDIO high, switch from JTAG to SWD, 50+ cycles with SWDIO high, 2 clock cycles with SWDIO low
     virtual void reset() = 0;
 };
-COCO_ENUM(SwdDevice::Request)
 
 } // namespace coco

@@ -1,19 +1,16 @@
 #include "SwdDevice_SPI.hpp"
 #include <coco/bits.hpp>
+#include <coco/swd.hpp>
 #include <coco/convert.hpp>
 #include <coco/debug.hpp>
 
 
 namespace coco {
 
-constexpr int SPI_CR2_DS_5BIT = SPI_CR2_DS_2 | SPI_CR2_FRXTH;
-constexpr int SPI_CR2_DS_8BIT = SPI_CR2_DS_2 | SPI_CR2_DS_1 | SPI_CR2_DS_0 | SPI_CR2_FRXTH;
-constexpr int SPI_CR2_DS_13BIT = SPI_CR2_DS_3 | SPI_CR2_DS_2;
-
 // SwdDevice_SPI
 
 SwdDevice_SPI::SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config misoPin, gpio::Config mosiPin,
-    const spi::Info &spiInfo, spi::ClockConfig clockConfig)
+    const spi::Info &spiInfo, spi::Format prescaler)
     : SwdDevice(State::READY)
     , loop_(loop)
     , mosiPin_(mosiPin)
@@ -25,11 +22,14 @@ SwdDevice_SPI::SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config
     gpio::enableInput(mosiPin);
 
     spi_ = spiInfo.enableClock()
-        .configureMaster(clockConfig,
-            spi::Config::PHA1_POL1 | spi::Config::LSB_FIRST,
-            spi::Format::DATA_8,
-            spi::Interrupt::RX)
-        .start();
+        .enable(spi::Config::SINGLE_MASTER,
+            //(prescaler & spi::Format::CLOCK_DIV_MASK) | spi::Format::PHA1_POL1 | spi::Format::LSB_FIRST | spi::Format::DATA_8,
+            (prescaler & spi::Format::CLOCK_DIV_MASK)
+                | spi::Format::PHA1_POL1 // sample on rising edge
+                | spi::Format::LSB_FIRST
+                | spi::Format::DATA_8,
+            spi::Interrupt::RX);
+        //.start();
 }
 
 int SwdDevice_SPI::getBufferCount() {
@@ -71,8 +71,10 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             // switch to ACK phase
             phase_ = Phase::ACK;
 
-            // read 1 bit turnaround, 3 bit ACK, 1 bit turnaround or first read data bit
-            spi_.setFormat(spi::Format::DATA_5);
+            // read 1 bit turnaround, 3 bit ACK, 1 bit turnaround (write) or first read data bit (read)
+            spi_
+                .setDataSize(spi::Format::DATA_5)
+                .start();
 
             // dummy write to start read transfer
             TXDR8 = 0;
@@ -84,10 +86,35 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             int reply = RXDR8;
 
             // extract ack field (3 bits)
-            uint8_t ack = (reply >> 1) & 7;
-            //debug::out << "ack " << hex(ack) << '\n';
+            int ack = (reply >> 1) & 7;
 
-            if (!write_) {
+            // debug: read ack field, should be 1
+            // https://developer.arm.com/documentation/ihi0031/a/The-Serial-Wire-Debug-Port--SW-DP-/Protocol-description/The-OK-response
+            //debug::out << "ack " << hex(ack_) << '\n';
+
+            if (ack != 1) {
+                // error: end of transfer
+
+                // return to request phase
+                phase_ = Phase::REQUEST;
+
+                auto b = transfers_.pop(
+                    [](BufferBase &next) {
+                        // start next buffer
+                        next.transfer();
+                    }
+                );
+                if (b != nullptr) {
+                    auto &buffer = *b;
+                    buffer.setError(ack == 2 ? std::errc::resource_unavailable_try_again : std::errc::io_error);
+
+                    // notify app that buffer has finished
+                    loop_.push(buffer);
+                }
+                if (transfers_.empty() && resetPending_) {
+                    startReset();
+                }
+            } else if (!write_) {
                 // read 33 bytes (31 data, 1 parity, 1 turnaround)
 
                 // read is done in three phases (12 13 8)
@@ -97,7 +124,9 @@ void SwdDevice_SPI::SPI_IRQHandler() {
                 data_ = (reply >> 4) & 1;
 
                 // read first 12 bit
-                spi_.setFormat(spi::Format::DATA_12);
+                spi_
+                    .setDataSize(spi::Format::DATA_12)
+                    .start();
 
                 // start transfer
                 TXDR16 = 0;
@@ -111,7 +140,9 @@ void SwdDevice_SPI::SPI_IRQHandler() {
                 phase_ = Phase::WRITE_DATA1;
 
                 // write first 13 bit
-                spi_.setFormat(spi::Format::DATA_13);
+                spi_
+                    .setDataSize(spi::Format::DATA_13)
+                    .start();
 
                 // start transfer
                 uint32_t data = data_;
@@ -131,7 +162,9 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             phase_ = Phase::READ_DATA2;
 
             // read next 13 bit
-            spi_.setFormat(spi::Format::DATA_13);
+            spi_
+                .setDataSize(spi::Format::DATA_13)
+                .start();
 
             // start transfer
             TXDR16 = 0;
@@ -148,7 +181,9 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             phase_ = Phase::READ_DATA3;
 
             // read remaining 8 bit
-            spi_.setFormat(spi::Format::DATA_8);
+            spi_
+                .setDataSize(spi::Format::DATA_8)
+                .start();
 
             // start transfer
             TXDR8 = 0;
@@ -168,22 +203,25 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             phase_ = Phase::REQUEST;
 
             // end of transfer
-            int r = transfers_.pop(
-                [this, data, parityError](BufferBase &buffer) {
-                    *(uint32_t *)buffer.data_ = data;
-                    buffer.size_ = 4;
-                    buffer.result_ = parityError ? BufferBase::Result::FAIL : BufferBase::Result::SUCCESS;
-
-                    // notify app that buffer has finished
-                    loop_.push(buffer);
-                    return true;
-                },
+            auto b = transfers_.pop(
                 [](BufferBase &next) {
                     // start next buffer
                     next.start();
                 }
             );
-            if (r != 2 && resetPending_) {
+            if (b != nullptr) {
+                auto &buffer = *b;
+                *(uint32_t *)buffer.data_ = data;
+
+                if (parityError)
+                    buffer.setError(std::errc::io_error);
+                else
+                    buffer.setSuccess(4);
+
+                // notify app that buffer has finished
+                loop_.push(buffer);
+            }
+            if (transfers_.empty() && resetPending_) {
                 startReset();
             }
         }
@@ -214,7 +252,9 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             phase_ = Phase::WRITE_DATA3;
 
             // write remaining 8 bit
-            spi_.setFormat(spi::Format::DATA_8);
+            spi_
+                .setDataSize(spi::Format::DATA_8)
+                .start();
 
             // start transfer
             uint32_t data = data_;
@@ -233,18 +273,20 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             phase_ = Phase::REQUEST;
 
             // end of transfer
-            int r = transfers_.pop(
-                [this](BufferBase &buffer) {
-                    // notify app that buffer has finished
-                    loop_.push(buffer);
-                    return true;
-                },
+            auto b = transfers_.pop(
                 [](BufferBase &next) {
                     // start next buffer
-                    next.start();
+                    next.transfer();
                 }
             );
-            if (r != 2 && resetPending_) {
+            if (b != nullptr) {
+                auto &buffer = *b;
+                buffer.setSuccess(4);
+
+                // notify app that buffer has finished
+                loop_.push(buffer);
+            }
+            if (transfers_.empty() && resetPending_) {
                 startReset();
             }
         }
@@ -259,6 +301,8 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             if (data > 0) {
                 // send more clock cycles
                 data_ = data - 1;
+
+                // 50+ (64) clocks SWDIO high, switch squence (0xE79E), 50+ (62) clocks SWDIO high, 2 clocks SWDIO low
                 TXDR16 = data == 5 ? 0b1110011110011110 : (data == 1 ? 0b0011111111111111 : 0xffff);
             } else {
                 // reset finished
@@ -269,11 +313,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
 
                 // reset format and phase
                 phase_ = Phase::REQUEST;
-                spi_.setFormat(spi::Format::DATA_8);
+                spi_
+                    .setDataSize(spi::Format::DATA_8)
+                    .start();
 
                 transfers_.visitFirst([](BufferBase &next) {
                     // start next buffer
-                    next.start();
+                    next.transfer();
                 });
             }
         }
@@ -289,10 +335,12 @@ void SwdDevice_SPI::startReset() {
 
     phase_ = Phase::RESET;
 
-    // start 50 clock cycles
-    spi_.setFormat(spi::Format::DATA_16);
+    // start minimum 50 clock cycles
+    spi_
+        .setDataSize(spi::Format::DATA_16)
+        .start();
 
-    // use as counter
+    // use as counter for reset clock cycles
     data_ = 8;
 
     TXDR16 = 0xffff;
@@ -303,7 +351,7 @@ void SwdDevice_SPI::startReset() {
 // SwdDevice_SPI::BufferBase
 
 SwdDevice_SPI::BufferBase::BufferBase(uint8_t *data, int capacity, SwdDevice_SPI &device)
-    : coco::Buffer(data, 4, 0, capacity, BufferBase::State::READY), device_(device)
+    : coco::Buffer(data, 4, capacity, BufferBase::State::READY), device_(device)
 {
     device.buffers_.add(*this);
 }
@@ -311,22 +359,22 @@ SwdDevice_SPI::BufferBase::BufferBase(uint8_t *data, int capacity, SwdDevice_SPI
 SwdDevice_SPI::BufferBase::~BufferBase() {
 }
 
-bool SwdDevice_SPI::BufferBase::start(Op op) {
-    if (st.state != State::READY) {
-        assert(st.state != State::BUSY);
+bool SwdDevice_SPI::BufferBase::start() {
+    if (state_ != State::READY) {
+        assert(false);
+        setError(std::errc::resource_unavailable_try_again);
         return false;
     }
-
-    // check if READ or WRITE flag is set
-    assert((op & Op::READ_WRITE) != 0);
-
-    op_ = op;
+    if ((op_ & Op::READ_WRITE) == 0 || size_ == 0) {
+        setSuccess();
+        return false;
+    }
     auto &device = device_;
 
     // add to list of pending transfers and start immediately if list was empty
-    if (device.transfers_.push(nvic::Guard(device.spiIrq_), *this)) {
+    if (device.transfers_.guardedPush(nvic::Guard(device.spiIrq_), *this)) {
         if (!device.resetPending_)
-            start();
+            transfer();
     }
 
     // set state
@@ -336,21 +384,23 @@ bool SwdDevice_SPI::BufferBase::start(Op op) {
 }
 
 bool SwdDevice_SPI::BufferBase::cancel() {
-    if (st.state != State::BUSY)
+    if (state_ != State::BUSY)
         return false;
     auto &device = device_;
 
     // remove from pending transfers if not yet started, otherwise complete normally
-    if (device.transfers_.remove(nvic::Guard(device.spiIrq_), *this, false)) {
+    if (device.transfers_.guardedRemoveExceptFirst(nvic::Guard(device.spiIrq_), *this)) {
         // cancel succeeded: set buffer ready again
+        setError(std::errc::operation_canceled);
+
         // resume application code, therefore interrupt should be enabled at this point
-        setReady(0);
+        setReady();
     }
 
     return true;
 }
 
-void SwdDevice_SPI::BufferBase::start() {
+void SwdDevice_SPI::BufferBase::transfer() {
     auto &device = device_;
     auto &TXDR8 = device.spi_.TXDR8();
 
@@ -360,7 +410,7 @@ void SwdDevice_SPI::BufferBase::start() {
     // create request byte
     bool write = device.write_ = (op_ & Op::WRITE) != 0;
     uint8_t request = 1 // start
-        | (header_[0] & uint8_t(SwdDevice::Request::PORT_MASK | SwdDevice::Request::ADDRESS_MASK)) // port and address
+        | (header_[0] & uint8_t(swd::Register::PORT_MASK | swd::Register::ADDRESS_MASK)) // port and address
         | (write ? 0 : 4) // read/write
         | 0x80; // park
 
@@ -374,9 +424,9 @@ void SwdDevice_SPI::BufferBase::start() {
 
     // start write
     TXDR8 = request;
+    debug::out << "start " << hex(request) << "\n";
 
     // -> wait for SPI interrupt
-    //debug::out << "start " << hex(request) << "\n";
 }
 
 void SwdDevice_SPI::BufferBase::handle() {

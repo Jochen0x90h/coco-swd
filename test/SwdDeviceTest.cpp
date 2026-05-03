@@ -6,6 +6,11 @@
 
 using namespace coco;
 
+template <int N>
+struct FixedArray {
+    uint32_t data[N];
+};
+
 Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
     while (buffer.ready()) {
         //debug::toggleGreen();
@@ -60,7 +65,7 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         buffer.cast<uint32_t &>() = 0x50000000;
         co_await buffer.write(4);
         debug::sleep(10us);
-        co_await buffer.read();
+        co_await buffer.read(4);
         if ((buffer.cast<uint32_t &>() & 0xf0000000) != 0xf0000000) {
             debug::out << "error: power up failed\n";
             continue;
@@ -82,11 +87,9 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         //debug::sleep(100us);
 
         // read csw
-        buffer.header<swd::Register>() = swd::Register::CSW;
-        co_await buffer.read(4);
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
-        co_await buffer.read(4);
-        //debug::out << "csw " << hex(buffer.value<uint32_t>()) << '\n';
+        //buffer.header<swd::Register>() = swd::Register::CSW;
+        //co_await buffer.read(4);
+        //debug::out << "csw " << hex(buffer.cast<uint32_t>()) << '\n';
 
         // configure
         buffer.header<swd::Register>() = swd::Register::CSW;
@@ -98,11 +101,9 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         //    | swd::ControlStatusWord::SIZE_32);
 
         // read csw
-        /*buffer.header<swd::Register>() = swd::Register::CSW;
-        co_await buffer.read();
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
-        co_await buffer.read();
-        debug::out << "csw " << hex(buffer.value<uint32_t>()) << '\n';*/
+        buffer.header<swd::Register>() = swd::Register::CSW;
+        co_await buffer.read(4);
+        debug::out << "csw " << hex(buffer.cast<uint32_t>()) << '\n';
 
 
         /*// get device id
@@ -110,8 +111,6 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         buffer.cast<uint32_t &>() = 0x1FFF7590UL;
         co_await buffer.write(4);
         buffer.header<swd::Register>() = swd::Register::DRW;
-        co_await buffer.read(4);
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
         co_await buffer.read(4);
         debug::out << "device " << hex(buffer.value<uint32_t>()) << '\n';
         */
@@ -121,16 +120,11 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         buffer.cast<uint32_t &>() = 0x08000000;
         co_await buffer.write(4);
 
-        // there is one word "delay", read last word from RDBUFF
         for (int i = 0; i < 16; ++i) {
             buffer.header<swd::Register>() = swd::Register::DRW;
             co_await buffer.read(4);
-            if (i != 0)
-                debug::out << hex(buffer.cast<uint32_t &>()) << ' ';
+            debug::out << hex(buffer.cast<uint32_t>()) << ' ';
         }
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
-        co_await buffer.read(4);
-        debug::out << hex(buffer.cast<uint32_t &>()) << '\n';
 */
 
         // check lock (read FLASH->CR)
@@ -139,54 +133,48 @@ Coroutine write(Loop &loop, SwdDevice &swd, Buffer &buffer) {
         co_await buffer.write(4);
         buffer.header<swd::Register>() = swd::Register::DRW;
         co_await buffer.read(4);
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
-        co_await buffer.read(4);
         if (buffer.error()) {
             // print error message
             debug::out << buffer.error().message() << " while reading FLASH->CR\n";
             continue;
         }
-        debug::out << "pre FLASH->CR " << hex(buffer.cast<uint32_t>()) << '\n';
+        uint32_t flashCR = buffer.cast<uint32_t>();
+        debug::out << "pre FLASH->CR " << hex(flashCR) << '\n';
+        if (flashCR & 0x80000000) {
 
+            // read ctrl/stat (always allowed)
+            buffer.header<swd::Register>() = swd::Register::CTRL_STAT;
+            co_await buffer.read(4);
+            debug::out << "ctrl/stat2 " << hex(buffer.cast<uint32_t>()) << '\n';
 
-        // read ctrl/stat (always allowed)
-        buffer.header<swd::Register>() = swd::Register::CTRL_STAT;
-        co_await buffer.read(4);
-        debug::out << "ctrl/stat2 " << hex(buffer.cast<uint32_t>()) << '\n';
+            // unlock (write keys to FLASH->KEYR)
+            buffer.header<swd::Register>() = swd::Register::TAR;
+            buffer.cast<uint32_t &>() = 0x40022008;
+            co_await buffer.write(4);
+            buffer.header<swd::Register>() = swd::Register::DRW;
+            buffer.cast<FixedArray<2> &>() = {0x45670123, 0xCDEF89AB};
+            co_await buffer.write(8);
+            if (buffer.error()) {
+                // print error message
+                debug::out << buffer.error().message() << " while unlocking\n";
+                continue;
+            }
+            debug::out << "unlocked\n";
+            debug::sleep(10us);
 
-        // unlock (write keys to FLASH->KEYR)
-        buffer.header<swd::Register>() = swd::Register::TAR;
-        buffer.cast<uint32_t &>() = 0x40022008;
-        co_await buffer.write(4);
-        buffer.header<swd::Register>() = swd::Register::DRW;
-        buffer.cast<uint32_t &>() = 0x45670123;
-        co_await buffer.write(4);
-        debug::sleep(10us);
-        buffer.cast<uint32_t &>() = 0xCDEF89AB;
-        co_await buffer.write(4);
-        if (buffer.error()) {
-            // print error message
-            debug::out << buffer.error().message() << " while unlocking\n";
-            continue;
+            // check lock (read FLASH->CR)
+            buffer.header<swd::Register>() = swd::Register::TAR;
+            buffer.cast<uint32_t &>() = 0x40022014;
+            co_await buffer.write(4);
+            buffer.header<swd::Register>() = swd::Register::DRW;
+            co_await buffer.read(4);
+            if (buffer.error()) {
+                // print error message
+                debug::out << buffer.error().message() << " while reading FLASH->CR\n";
+                continue;
+            }
+            debug::out << "FLASH->CR " << hex(buffer.cast<uint32_t>()) << '\n';
         }
-        debug::out << "unlocked\n";
-        debug::sleep(10us);
-
-        // check lock (read FLASH->CR)
-        buffer.header<swd::Register>() = swd::Register::TAR;
-        buffer.cast<uint32_t &>() = 0x40022014;
-        co_await buffer.write(4);
-        buffer.header<swd::Register>() = swd::Register::DRW;
-        co_await buffer.read(4);
-        buffer.header<swd::Register>() = swd::Register::RDBUFF;
-        co_await buffer.read(4);
-        if (buffer.error()) {
-            // print error message
-            debug::out << buffer.error().message() << " while reading FLASH->CR\n";
-            continue;
-        }
-        debug::out << "FLASH->CR " << hex(buffer.cast<uint32_t>()) << '\n';
-
     }
 }
 

@@ -2,6 +2,7 @@
 
 #include <coco/SwdDevice.hpp>
 #include <coco/align.hpp>
+#include <coco/swd.hpp>
 #include <coco/platform/Loop_Queue.hpp>
 #include <coco/platform/gpio.hpp>
 #include <coco/platform/spi.hpp>
@@ -10,7 +11,6 @@
 
 
 namespace coco {
-
 
 /// @brief Implementation of SWD for STM32
 /// https://qcentlabs.com/posts/swd_banger/
@@ -43,7 +43,6 @@ public:
         bool cancel() override;
 
     protected:
-        void transfer();
         void handle() override;
 
         SwdDevice_SPI &device_;
@@ -69,12 +68,25 @@ public:
     // SwdDevice methods
     void reset() override;
 
-    /// @brief Call from interrupt handler.
+    /// @brief Call from SPI interrupt handler.
     /// See startup_stm32XXX.c, e.g. SPI1_IRQHandler()
     void SPI_IRQHandler();
 
 protected:
+    // send reset sequence and switch to SWD
     void startReset();
+
+    // transfer first 32 bit word
+    void transferFirst(BufferBase &buffer) {
+        bool write = write_ = (buffer.op_ & BufferBase::Op::WRITE) != 0;
+        auto reg = swd::Register(buffer.header_[0]);
+
+        index_ = (!write && (reg & swd::Register::PORT_MASK) == swd::Register::ACCESS_PORT) ? -1 : 0;
+        transferNext(buffer);
+    }
+
+    // transfer next 32 bit words
+    bool transferNext(BufferBase &buffer);
 
     Loop_Queue &loop_;
     gpio::Config mosiPin_;
@@ -86,6 +98,7 @@ protected:
     bool resetPending_ = false;
     bool write_;
     uint32_t data_;
+    int index_;
 
     // state machine
     enum class Phase {
@@ -99,7 +112,7 @@ protected:
         READ_DATA3,
         RESET
     };
-    Phase phase_ = Phase::REQUEST;
+    Phase phase_;
 
     // list of buffers
     IntrusiveList<BufferBase> buffers_;

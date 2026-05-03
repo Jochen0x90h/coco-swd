@@ -22,8 +22,8 @@ struct Drivers {
         gpio::PB5 | gpio::AF5 | gpio::Config::SPEED_MEDIUM | gpio::Config::PULL_UP, // SPI1 MOSI (CN9 5)
         spi::SPI1_INFO,
         spi::Format::CLOCK_DIV_8};
-    SwdDevice::Buffer<4> buffer1{swd};
-    SwdDevice::Buffer<4> buffer2{swd};
+    SwdDevice::Buffer<64> buffer1{swd};
+    SwdDevice::Buffer<64> buffer2{swd};
 };
 
 Drivers drivers;

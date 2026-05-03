@@ -1,6 +1,5 @@
 #include "SwdDevice_SPI.hpp"
 #include <coco/bits.hpp>
-#include <coco/swd.hpp>
 #include <coco/convert.hpp>
 #include <coco/debug.hpp>
 
@@ -93,15 +92,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             //debug::out << "ack " << hex(ack_) << '\n';
 
             if (ack != 1) {
-                // error: end of transfer
+                // error
 
-                // return to request phase
-                phase_ = Phase::REQUEST;
-
+                // abort transfer
                 auto b = transfers_.pop(
-                    [](BufferBase &next) {
+                    [this](BufferBase &next) {
                         // start next buffer
-                        next.transfer();
+                        transferFirst(next);
                     }
                 );
                 if (b != nullptr) {
@@ -199,24 +196,32 @@ void SwdDevice_SPI::SPI_IRQHandler() {
 
             int parityError = parity(data) ^ ((tail >> 6) & 1);
 
-            // return to request phase
-            phase_ = Phase::REQUEST;
-
             // end of transfer
-            auto b = transfers_.pop(
-                [](BufferBase &next) {
+            auto b = transfers_.popIf(
+                [this, data, parityError](BufferBase &buffer) {
+                    if (parityError) {
+                        buffer.setError(std::errc::io_error);
+                        //debug::out << "parity error\n";
+                        return true;
+                    }
+
+                    // store data, index is -1 for first word of data read (Register::DRW)
+                    int index = index_;
+                    if (index >= 0)
+                        ((uint32_t *)buffer.data_)[index] = data;
+                    index_ = index + 1;
+                    //debug::out << "read " << dec(index) << ": " << hex(data) << '\n';
+
+                    // transfer next word or pop buffer
+                    return transferNext(buffer);
+                },
+                [this](BufferBase &next) {
                     // start next buffer
-                    next.start();
+                    transferFirst(next);
                 }
             );
             if (b != nullptr) {
                 auto &buffer = *b;
-                *(uint32_t *)buffer.data_ = data;
-
-                if (parityError)
-                    buffer.setError(std::errc::io_error);
-                else
-                    buffer.setSuccess(4);
 
                 // notify app that buffer has finished
                 loop_.push(buffer);
@@ -269,19 +274,19 @@ void SwdDevice_SPI::SPI_IRQHandler() {
             int dummy = RXDR8;
             (void)dummy;
 
-            // return to request phase
-            phase_ = Phase::REQUEST;
-
             // end of transfer
-            auto b = transfers_.pop(
-                [](BufferBase &next) {
+            auto b = transfers_.popIf(
+                [this](BufferBase &buffer) {
+                    // transfer next word or pop buffer
+                    return transferNext(buffer);
+                },
+                [this](BufferBase &next) {
                     // start next buffer
-                    next.transfer();
+                    transferFirst(next);
                 }
             );
             if (b != nullptr) {
                 auto &buffer = *b;
-                buffer.setSuccess(4);
 
                 // notify app that buffer has finished
                 loop_.push(buffer);
@@ -311,15 +316,13 @@ void SwdDevice_SPI::SPI_IRQHandler() {
                 // disable output
                 gpio::enableInput(mosiPin_);
 
-                // reset format and phase
-                phase_ = Phase::REQUEST;
                 spi_
                     .setDataSize(spi::Format::DATA_8)
                     .start();
 
-                transfers_.visitFirst([](BufferBase &next) {
+                transfers_.visitFirst([this](BufferBase &next) {
                     // start next buffer
-                    next.transfer();
+                    transferFirst(next);
                 });
             }
         }
@@ -333,8 +336,6 @@ void SwdDevice_SPI::startReset() {
     // enable output
     gpio::enableAlternate(mosiPin_);
 
-    phase_ = Phase::RESET;
-
     // start minimum 50 clock cycles
     spi_
         .setDataSize(spi::Format::DATA_16)
@@ -343,9 +344,60 @@ void SwdDevice_SPI::startReset() {
     // use as counter for reset clock cycles
     data_ = 8;
 
+    // set phase to reset
+    phase_ = Phase::RESET;
+
+    // send first 16 clock cycles with SWDIO high
     TXDR16 = 0xffff;
 }
 
+bool SwdDevice_SPI::transferNext(BufferBase &buffer) {
+    int size = buffer.size_ >> 2;
+    if (index_ >= size) {
+        // all data transferred
+        buffer.setSuccess();
+        return true;
+    }
+
+    auto &TXDR8 = spi_.TXDR8();
+
+    // enable output
+    gpio::enableAlternate(mosiPin_);
+
+    bool write = write_;// = (buffer.op_ & BufferBase::Op::WRITE) != 0;
+    auto reg = swd::Register(buffer.header_[0]);
+
+    if (index_ == size - 1 && !write && (reg & swd::Register::PORT_MASK) == swd::Register::ACCESS_PORT) {
+        // special handling of data read: read last word from RDBUFF
+        reg = swd::Register::RDBUFF;
+    }
+
+    // create request byte
+    uint8_t request = 1 // start
+        | uint8_t(reg & (swd::Register::PORT_MASK | swd::Register::ADDRESS_MASK)) // port and address
+        | (write ? 0 : 4) // read/write
+        | 0x80; // park
+
+    // parity
+    request |= ((request << 4) ^ (request << 3) ^ (request << 2) ^ (request << 1)) & (1 << 5);
+
+    // get data to write if it is a write request
+    if (write) {
+        data_ = ((uint32_t *)buffer.data_)[index_];
+        //debug::out << "write " << hex(data_) << ' ' << dec(index_) << ' ' << dec(buffer.size_ >> 2) << '\n';
+        ++index_;
+    }
+
+    // set phase to request
+    phase_ = Phase::REQUEST;
+
+    // start write
+    TXDR8 = request;
+    //debug::out << "start " << hex(request) << "\n";
+
+    // -> wait for SPI interrupt
+    return false;
+}
 
 
 // SwdDevice_SPI::BufferBase
@@ -374,7 +426,7 @@ bool SwdDevice_SPI::BufferBase::start() {
     // add to list of pending transfers and start immediately if list was empty
     if (device.transfers_.guardedPush(nvic::Guard(device.spiIrq_), *this)) {
         if (!device.resetPending_)
-            transfer();
+            device.transferFirst(*this);
     }
 
     // set state
@@ -398,35 +450,6 @@ bool SwdDevice_SPI::BufferBase::cancel() {
     }
 
     return true;
-}
-
-void SwdDevice_SPI::BufferBase::transfer() {
-    auto &device = device_;
-    auto &TXDR8 = device.spi_.TXDR8();
-
-    // enable output
-    gpio::enableAlternate(device.mosiPin_);
-
-    // create request byte
-    bool write = device.write_ = (op_ & Op::WRITE) != 0;
-    uint8_t request = 1 // start
-        | (header_[0] & uint8_t(swd::Register::PORT_MASK | swd::Register::ADDRESS_MASK)) // port and address
-        | (write ? 0 : 4) // read/write
-        | 0x80; // park
-
-    // parity
-    request |= ((request << 4) ^ (request << 3) ^ (request << 2) ^ (request << 1)) & (1 << 5);
-
-    // get data to write if it is a write request
-    if (write) {
-        device.data_ = *(uint32_t *)(data_);
-    }
-
-    // start write
-    TXDR8 = request;
-    debug::out << "start " << hex(request) << "\n";
-
-    // -> wait for SPI interrupt
 }
 
 void SwdDevice_SPI::BufferBase::handle() {

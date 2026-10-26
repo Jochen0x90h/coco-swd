@@ -6,6 +6,8 @@
 
 namespace coco {
 
+#ifdef HAVE_SPI_DATA_4_16
+
 // SwdDevice_SPI
 
 SwdDevice_SPI::SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config misoPin, gpio::Config mosiPin,
@@ -24,7 +26,7 @@ SwdDevice_SPI::SwdDevice_SPI(Loop_Queue &loop, gpio::Config sckPin, gpio::Config
         .enable(spi::Config::SINGLE_MASTER,
             //(prescaler & spi::Format::CLOCK_DIV_MASK) | spi::Format::PHA1_POL1 | spi::Format::LSB_FIRST | spi::Format::DATA_8,
             (prescaler & spi::Format::CLOCK_DIV_MASK)
-                | spi::Format::PHA1_POL1 // sample on rising edge
+                | spi::Format::PHA1_POL1 // sample on rising edge (SWD outputs and samples on rising edge)
                 | spi::Format::LSB_FIRST
                 | spi::Format::DATA_8,
             spi::Interrupt::RX);
@@ -452,8 +454,10 @@ bool SwdDevice_SPI::BufferBase::cancel() {
     return true;
 }
 
-void SwdDevice_SPI::BufferBase::handle() {
+void SwdDevice_SPI::BufferBase::onCompletion() {
     setReady();
 }
+
+#endif
 
 } // namespace coco

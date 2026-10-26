@@ -3,7 +3,7 @@
  ARM Serial Wire Debug (SWD) module for CoCo
 
 ## Import
-Add coco-swd/\<version> to your conanfile where version corresponds to the git tags
+Add coco-swd/\<version> to your conanfile where version corresponds to a git tag.
 
 ## Features
 * Uses coco::Buffer for transferring data to/from device

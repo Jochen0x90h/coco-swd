@@ -12,6 +12,9 @@
 
 namespace coco {
 
+// only supported when SPI supports variable data size
+#ifdef HAVE_SPI_DATA_4_16
+
 /// @brief Implementation of SWD for STM32
 /// https://qcentlabs.com/posts/swd_banger/
 class SwdDevice_SPI : public SwdDevice {
@@ -28,7 +31,7 @@ public:
 
 
     // internal buffer base class, derives from IntrusiveListNode for the list of buffers and Loop_Queue::Handler to be notified from the event loop
-    class BufferBase : public coco::Buffer, public IntrusiveListNode, public Loop_Queue::Handler {
+    class BufferBase : public coco::Buffer, public IntrusiveListNode, public Loop_Queue::CompletionHandler {
         friend class SwdDevice_SPI;
     public:
         /// @brief Constructor.
@@ -43,7 +46,7 @@ public:
         bool cancel() override;
 
     protected:
-        void handle() override;
+        void onCompletion() override;
 
         SwdDevice_SPI &device_;
     };
@@ -120,5 +123,7 @@ protected:
     // list of active transfers
     InterruptQueue<BufferBase> transfers_;
 };
+
+#endif
 
 } // namespace coco
